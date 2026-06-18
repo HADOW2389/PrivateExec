@@ -149,7 +149,7 @@ namespace LuaEngine {
                 // Spawn a new coroutine per script for isolation
                 lua_State* co = g_L;
                 if (LuaOffsets::rLuaE_newthread) {
-                    void* result = _seh_newthread(LuaOffsets::rLuaE_newthread, g_L);
+                    void* result = _seh_newthread(reinterpret_cast<void*>(LuaOffsets::rLuaE_newthread), g_L);
                     if (result) co = result;
                 }
                 Execute(co ? co : g_L, entry.source);
