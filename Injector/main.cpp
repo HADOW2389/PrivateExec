@@ -64,21 +64,11 @@ int main(int argc, char* argv[]) {
     pid = FindRobloxPid(pid);
     if (!pid) { std::cerr << "Process not found\n"; return 2; }
 
-    // 1. Load clean ntdll and resolve SSNs
-    wchar_t sysdir[MAX_PATH]{};
-    GetSystemDirectoryW(sysdir, MAX_PATH);
-    std::wstring ntdllPath = std::wstring(sysdir) + L"\\ntdll.dll";
-
-    std::vector<BYTE> ntdllBuf;
-    {
-        HANDLE hFile = CreateFileW(ntdllPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                   nullptr, OPEN_EXISTING, 0, nullptr);
-        DWORD sz = GetFileSize(hFile, nullptr);
-        ntdllBuf.resize(sz);
-        DWORD r = 0; ReadFile(hFile, ntdllBuf.data(), sz, &r, nullptr);
-        CloseHandle(hFile);
-    }
-    HMODULE hNtdll = reinterpret_cast<HMODULE>(ntdllBuf.data());
+    // 1. Resolve SSNs from the in-memory ntdll.
+    // SSNs are intact even in hooked stubs — hooks jump before the SSN is read.
+    // The in-memory mapping has correct virtual addresses, unlike a raw file buffer.
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) { std::cerr << "ntdll not found\n"; return 3; }
     if (!Syscall::Resolve(hNtdll)) {
         std::cerr << "SSN resolution failed\n"; return 3;
     }
@@ -95,7 +85,11 @@ int main(int argc, char* argv[]) {
     HANDLE hProcess = nullptr;
     OBJECT_ATTRIBUTES oa{sizeof(oa)};
     CLIENT_ID cid{ reinterpret_cast<HANDLE>(static_cast<uintptr_t>(pid)), nullptr };
-    NTSTATUS st = IndirectNtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &oa, &cid);
+    // PROCESS_ALL_ACCESS is often blocked; request only what mapping needs
+    constexpr DWORD NEEDED =
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+        PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD;
+    NTSTATUS st = IndirectNtOpenProcess(&hProcess, NEEDED, &oa, &cid);
     if (!NT_SUCCESS(st) || !hProcess) {
         std::cerr << "NtOpenProcess failed: " << std::hex << st << "\n"; return 5;
     }

@@ -36,12 +36,13 @@ namespace PrivateExec.Bridge {
             }
 
             try {
+                // UseShellExecute=true is required to honour the manifest's
+                // requireAdministrator level — shows UAC prompt once.
                 var psi = new ProcessStartInfo(InjectorPath) {
                     Arguments       = $"{pid} \"{PayloadPath}\"",
-                    UseShellExecute = false,
-                    CreateNoWindow  = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError  = true,
+                    UseShellExecute = true,   // allows Verb = runas / manifest elevation
+                    CreateNoWindow  = false,  // console briefly visible (needed for UAC)
+                    WindowStyle     = ProcessWindowStyle.Hidden,
                 };
                 using var proc = Process.Start(psi)!;
                 proc.WaitForExit(15_000);

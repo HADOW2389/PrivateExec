@@ -49,6 +49,9 @@
       <SubSystem>Console</SubSystem>
       <AdditionalDependencies>ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <Manifest>
+      <AdditionalManifestFiles>Injector.manifest</AdditionalManifestFiles>
+    </Manifest>
   </ItemDefinitionGroup>
 
   <ItemGroup>
