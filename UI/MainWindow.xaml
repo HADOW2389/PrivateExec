@@ -265,20 +265,20 @@
                             </Grid.ColumnDefinitions>
 
                             <!-- Left: small buttons -->
-                            <StackPanel Orientation="Horizontal" Spacing="6">
+                            <StackPanel Orientation="Horizontal">
                                 <Button Style="{StaticResource ActionBtn}" Content="Clear"
-                                        Click="ClearBtn_Click"/>
+                                        Margin="0,0,6,0" Click="ClearBtn_Click"/>
                                 <Button Style="{StaticResource ActionBtn}" Content="Open File"
-                                        Click="OpenFileBtn_Click"/>
+                                        Margin="0,0,6,0" Click="OpenFileBtn_Click"/>
                                 <Button Style="{StaticResource ActionBtn}" Content="Save"
                                         Click="SaveBtn_Click"/>
                             </StackPanel>
 
                             <!-- Right: Execute + Inject -->
-                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                            <StackPanel Grid.Column="1" Orientation="Horizontal">
                                 <Button x:Name="InjectBtn" Style="{StaticResource InjectBtn}"
                                         Content="Inject" Click="InjectBtn_Click"
-                                        Width="90"/>
+                                        Width="90" Margin="0,0,8,0"/>
                                 <Button x:Name="ExecBtn" Style="{StaticResource InjectBtn}"
                                         Content="Execute" Click="ExecBtn_Click"
                                         Width="90"
@@ -304,7 +304,7 @@
                     </Border>
 
                     <ScrollViewer Grid.Row="1" Padding="10">
-                        <StackPanel x:Name="ScriptList" Spacing="6"/>
+                        <StackPanel x:Name="ScriptList"/>
                     </ScrollViewer>
                 </Grid>
 
@@ -324,7 +324,7 @@
                     </Border>
 
                     <ScrollViewer Grid.Row="1" Padding="18">
-                        <StackPanel Spacing="14">
+                        <StackPanel>
 
                             <!-- Unlock FPS toggle -->
                             <Border Background="{StaticResource BgCard}"
@@ -424,8 +424,8 @@
                     </Grid.ColumnDefinitions>
 
                     <!-- Left: status -->
-                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="8">
-                        <Ellipse x:Name="StatusDot" Width="7" Height="7">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Ellipse x:Name="StatusDot" Width="7" Height="7" Margin="0,0,8,0">
                             <Ellipse.Fill>
                                 <SolidColorBrush x:Name="StatusDotColor" Color="#808080"/>
                             </Ellipse.Fill>
