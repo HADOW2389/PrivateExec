@@ -2,36 +2,27 @@
 #include "ManualMapper.hpp"
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <TlHelp32.h>
 
 // ── Entrypoint ───────────────────────────────────────────────────────────────
 // Usage: Injector.exe <pid> <path_to_dll>
-// Called by the C# bridge with the Roblox PID.
+// Writes a log to %TEMP%\PrivateExec_inject.log so the UI can surface errors.
 
-static HMODULE LoadCleanNtdll() {
-    // Load a clean copy of ntdll from disk — bypasses any AV hooks in the
-    // in-memory ntdll by reading from KnownDlls or the file directly.
-    wchar_t sysdir[MAX_PATH]{};
-    GetSystemDirectoryW(sysdir, MAX_PATH);
-    std::wstring path = std::wstring(sysdir) + L"\\ntdll.dll";
+static std::ofstream g_log;
 
-    // Map as image via file I/O — intentionally not using LoadLibrary so
-    // the second ntdll mapping is invisible to most integrity scanners.
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                               nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return nullptr;
+static void Log(const std::string& msg) {
+    std::cout << msg << "\n";
+    if (g_log.is_open()) g_log << msg << "\n" << std::flush;
+}
 
-    DWORD sz = GetFileSize(hFile, nullptr);
-    std::vector<BYTE> buf(sz);
-    DWORD read = 0;
-    ReadFile(hFile, buf.data(), sz, &read, nullptr);
-    CloseHandle(hFile);
-
-    // Map as data — we only need exports to resolve SSNs
-    return reinterpret_cast<HMODULE>(buf.data()); // lifetime == buf scope
-    // NOTE: caller must keep buf alive while Resolve() runs
+static void OpenLog() {
+    char tmp[MAX_PATH]{};
+    GetTempPathA(MAX_PATH, tmp);
+    std::string path = std::string(tmp) + "PrivateExec_inject.log";
+    g_log.open(path, std::ios::trunc);
 }
 
 static DWORD FindRobloxPid(DWORD hintPid) {
@@ -53,51 +44,61 @@ static DWORD FindRobloxPid(DWORD hintPid) {
 }
 
 int main(int argc, char* argv[]) {
+    OpenLog();
+    Log("[Injector] Start");
+
     if (argc < 3) {
-        std::cerr << "Usage: Injector.exe <pid> <dll_path>\n";
+        Log("[Injector] ERROR: wrong arg count");
         return 1;
     }
 
     DWORD pid     = static_cast<DWORD>(std::stoul(argv[1]));
     std::string dllPath = argv[2];
+    Log(std::string("[Injector] pid=") + std::to_string(pid) + " dll=" + dllPath);
 
     pid = FindRobloxPid(pid);
-    if (!pid) { std::cerr << "Process not found\n"; return 2; }
+    if (!pid) { Log("[Injector] ERROR: process not found"); return 2; }
+    Log(std::string("[Injector] Using pid=") + std::to_string(pid));
 
     // 1. Resolve SSNs from the in-memory ntdll.
-    // SSNs are intact even in hooked stubs — hooks jump before the SSN is read.
-    // The in-memory mapping has correct virtual addresses, unlike a raw file buffer.
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (!hNtdll) { std::cerr << "ntdll not found\n"; return 3; }
+    if (!hNtdll) { Log("[Injector] ERROR: ntdll not loaded"); return 3; }
+    Log("[Injector] Resolving syscalls...");
     if (!Syscall::Resolve(hNtdll)) {
-        std::cerr << "SSN resolution failed\n"; return 3;
+        Log("[Injector] ERROR: SSN resolution failed");
+        return 3;
     }
+    Log("[Injector] Syscalls OK");
 
     // 2. Read DLL from disk
     std::ifstream file(dllPath, std::ios::binary | std::ios::ate);
-    if (!file) { std::cerr << "DLL not found: " << dllPath << "\n"; return 4; }
+    if (!file) { Log("[Injector] ERROR: DLL not found: " + dllPath); return 4; }
     auto size = file.tellg(); file.seekg(0);
     std::vector<BYTE> dllBuf(static_cast<size_t>(size));
     file.read(reinterpret_cast<char*>(dllBuf.data()), size);
     file.close();
+    Log(std::string("[Injector] DLL read: ") + std::to_string(size) + " bytes");
 
     // 3. Open target process via indirect syscall
     HANDLE hProcess = nullptr;
     OBJECT_ATTRIBUTES oa{sizeof(oa)};
     CLIENT_ID cid{ reinterpret_cast<HANDLE>(static_cast<uintptr_t>(pid)), nullptr };
-    // PROCESS_ALL_ACCESS is often blocked; request only what mapping needs
     constexpr DWORD NEEDED =
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
         PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD;
     NTSTATUS st = IndirectNtOpenProcess(&hProcess, NEEDED, &oa, &cid);
     if (!NT_SUCCESS(st) || !hProcess) {
-        std::cerr << "NtOpenProcess failed: " << std::hex << st << "\n"; return 5;
+        std::ostringstream oss;
+        oss << "[Injector] ERROR: NtOpenProcess NTSTATUS=0x" << std::hex << st;
+        Log(oss.str());
+        return 5;
     }
+    Log("[Injector] Process opened OK");
 
     // 4. Manual map
+    Log("[Injector] Mapping DLL...");
     bool ok = ManualMap::Map(hProcess, dllBuf);
     CloseHandle(hProcess);
-
-    std::cout << (ok ? "OK" : "FAIL") << "\n";
+    Log(ok ? "[Injector] Map OK" : "[Injector] ERROR: Map FAILED");
     return ok ? 0 : 6;
 }

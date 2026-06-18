@@ -157,7 +157,11 @@ namespace PrivateExec {
                 ProcInfo.Text = $"RobloxPlayerBeta  PID {pid}";
                 ExecBtn.IsEnabled = true;
             } else {
-                SetStatus("Injection failed", "#ED4245");
+                SetStatus("Injection failed — see details", "#ED4245");
+                // Show the injector log so user can see exactly what failed
+                MessageBox.Show(_bridge.LastInjectLog,
+                    "Inject failed — diagnostics",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
                 InjectBtn.IsEnabled = true;
             }
         }

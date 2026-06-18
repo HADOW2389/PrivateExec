@@ -23,32 +23,53 @@ namespace PrivateExec.Bridge {
         public string WorkspaceFolder { get; set; } =
             Path.Combine(AppContext.BaseDirectory, "workspace");
 
+        // Path where Injector.exe writes its diagnostic log
+        private static string LogPath =>
+            Path.Combine(Path.GetTempPath(), "PrivateExec_inject.log");
+
+        // Last log content — UI can read this to show the actual error
+        public string LastInjectLog { get; private set; } = "";
+
         // ── Inject ────────────────────────────────────────────────────────────
         // Launches Injector.exe <pid> <dll_path> and waits up to 15 seconds.
         public bool Inject(int pid) {
             if (!File.Exists(InjectorPath)) {
-                Log($"Injector not found: {InjectorPath}");
+                LastInjectLog = $"Injector not found:\n{InjectorPath}";
+                Log(LastInjectLog);
                 return false;
             }
             if (!File.Exists(PayloadPath)) {
-                Log($"Payload not found: {PayloadPath}");
+                LastInjectLog = $"Payload not found:\n{PayloadPath}";
+                Log(LastInjectLog);
                 return false;
             }
 
+            // Clear previous log
+            try { File.Delete(LogPath); } catch { }
+
             try {
-                // UseShellExecute=true is required to honour the manifest's
-                // requireAdministrator level — shows UAC prompt once.
                 var psi = new ProcessStartInfo(InjectorPath) {
                     Arguments       = $"{pid} \"{PayloadPath}\"",
-                    UseShellExecute = true,   // allows Verb = runas / manifest elevation
-                    CreateNoWindow  = false,  // console briefly visible (needed for UAC)
+                    UseShellExecute = true,
                     WindowStyle     = ProcessWindowStyle.Hidden,
                 };
                 using var proc = Process.Start(psi)!;
                 proc.WaitForExit(15_000);
+
+                // Read log written by Injector
+                try {
+                    LastInjectLog = File.Exists(LogPath)
+                        ? File.ReadAllText(LogPath)
+                        : $"(no log) exit={proc.ExitCode}";
+                } catch {
+                    LastInjectLog = $"exit={proc.ExitCode}";
+                }
+
+                Log($"Inject exit={proc.ExitCode}\n{LastInjectLog}");
                 return proc.ExitCode == 0;
             } catch (Exception ex) {
-                Log($"Inject exception: {ex.Message}");
+                LastInjectLog = $"Launch failed: {ex.Message}";
+                Log(LastInjectLog);
                 return false;
             }
         }
