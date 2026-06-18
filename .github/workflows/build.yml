@@ -1,0 +1,116 @@
+name: Build PrivateExec
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  # Ручной запуск из GitHub UI
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest   # Windows Server 2022 с VS 2022 + MSVC
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Setup MSVC (для C++ проектов) ────────────────────────────────────
+      - name: Setup MSVC Dev Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ── 3. Setup .NET 8 (для WPF UI) ────────────────────────────────────────
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # ── 4. Restore NuGet пакеты (опционально, для vcpkg не нужно) ───────────
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # ── 5. Сборка Injector (C++ EXE) ────────────────────────────────────────
+      - name: Build Injector
+        working-directory: Injector
+        run: |
+          msbuild Injector.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SolutionDir="${{ github.workspace }}\" `
+            /m
+
+      # ── 6. Сборка Payload (C++ DLL) ─────────────────────────────────────────
+      - name: Build Payload
+        working-directory: Payload
+        run: |
+          msbuild Payload.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SolutionDir="${{ github.workspace }}\" `
+            /m
+
+      # ── 7. Сборка UI (C# WPF) ───────────────────────────────────────────────
+      - name: Build UI
+        working-directory: UI
+        run: |
+          dotnet publish UI.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            --output "${{ github.workspace }}\publish"
+
+      # ── 8. Копируем Injector.exe и Payload.dll в папку publish ──────────────
+      - name: Collect binaries
+        run: |
+          $out = "${{ github.workspace }}\publish"
+          $bin = "${{ github.workspace }}\bin\x64\Release"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "$bin\Injector.exe" "$out\Injector.exe" -Force
+          Copy-Item "$bin\Payload.dll"  "$out\Payload.dll"  -Force
+          New-Item -ItemType Directory -Force -Path "$out\workspace" | Out-Null
+          Write-Host "Contents of publish:"
+          Get-ChildItem $out
+
+      # ── 9. Загружаем артефакт ────────────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrivateExec-x64
+          path: publish\
+          retention-days: 30
+
+  # ── Release job — только при push тега v* ──────────────────────────────────
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PrivateExec-x64
+          path: release/
+
+      - name: Zip release
+        run: |
+          cd release
+          zip -r ../PrivateExec-${{ github.ref_name }}-x64.zip .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PrivateExec-${{ github.ref_name }}-x64.zip
+          name: PrivateExec ${{ github.ref_name }}
+          body: |
+            Roblox version-8884371d30284041
+            - 100% UNC
+            - Manual Map (no PEB entry)
+            - Indirect Syscalls
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

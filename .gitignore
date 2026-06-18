@@ -1,0 +1,41 @@
+# Build outputs
+bin/
+obj/
+publish/
+*.user
+*.suo
+.vs/
+
+# .NET
+*.nupkg
+*.snupkg
+project.lock.json
+
+# C++ build artifacts
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+*.ipch
+*.aps
+*.ncb
+*.opensdf
+*.sdf
+*.cachefile
+
+# VS
+*.rsuser
+*.vspx
+*.vspscc
+.vs/
+
+# Rider
+.idea/
+*.sln.iml
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
