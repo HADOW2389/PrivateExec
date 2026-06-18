@@ -8,8 +8,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>PrivateExec</AssemblyName>
     <RootNamespace>PrivateExec</RootNamespace>
-    <ApplicationIcon>icon.ico</ApplicationIcon>
-    <Platforms>x64</Platforms>
+<Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
@@ -23,7 +22,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Text.Json" Version="8.0.0"/>
+    <PackageReference Include="System.Text.Json" Version="8.0.5"/>
   </ItemGroup>
 
 </Project>
