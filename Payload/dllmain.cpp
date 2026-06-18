@@ -17,10 +17,8 @@ static void MainThread() {
     // Let Roblox finish loading its modules before touching Lua state
     Sleep(2500);
 
-    OutputDebugStringA("[Exec] Resolving offsets...");
-    if (!LuaOffsets::Init())
-        OutputDebugStringA("[Exec] Offset resolution failed — version mismatch?");
-
+    // LuaEngine::Init() runs LuaOffsets::Init() internally and writes the log
+    OutputDebugStringA("[Exec] Initialising Lua engine...");
     if (!LuaEngine::Init())
         OutputDebugStringA("[Exec] LuaEngine init failed");
 

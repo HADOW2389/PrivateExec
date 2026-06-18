@@ -191,67 +191,190 @@ namespace offsets {
 } // namespace offsets
 
 
-// ── Lua VM function pointers (resolved via AoB at runtime) ──────────────────
-// These are code addresses inside RobloxPlayerBeta.exe, NOT field offsets.
-// Patterns are for version-8884371d30284041 — update if the binary changes.
+// ── Lua VM function pointers (resolved at runtime from decrypted process memory) ─
 
 namespace LuaOffsets {
 
-    inline uintptr_t rLuaL_loadbuffer  = 0;
-    inline uintptr_t rLuaD_call        = 0;
-    inline uintptr_t rLuaD_pcall       = 0;
-    inline uintptr_t rLuaE_newthread   = 0;
-    inline uintptr_t rLua_newthread    = 0;
-    inline uintptr_t rLuaO_nilobject   = 0;
-    inline uintptr_t rLua_getfield     = 0;
-    inline uintptr_t rLua_setfield     = 0;
-    inline uintptr_t rLua_pushstring   = 0;
-    inline uintptr_t rLua_pushnumber   = 0;
-    inline uintptr_t rLua_settop       = 0;
-    inline uintptr_t rLua_gettop       = 0;
-    inline uintptr_t rLua_type         = 0;
-    inline uintptr_t rLua_tostring     = 0;
-    inline uintptr_t rLua_tonumber     = 0;
+    inline uintptr_t rLuaL_loadbuffer = 0;
+    inline uintptr_t rLuaD_call       = 0;
+    inline uintptr_t rLuaD_pcall      = 0;
+    inline uintptr_t rLuaE_newthread  = 0;
 
-    // AoB patterns for version-8884371d30284041
-    // Verified against the binary — update after re-scan if needed.
+    // ── String-reference based finder ────────────────────────────────────────
+    // Locates a function by finding a LEA instruction that loads a known string
+    // literal, then walks backward through INT3 padding to the function start.
+    // Works on the decrypted in-memory binary (disk scan fails because Hyperion
+    // encrypts the .text section on disk but decrypts it before execution).
 
-    constexpr auto PAT_LOADBUFFER =
-        "55 8B EC 83 E4 F8 83 EC 1C 53 56 57 8B 7D 08 8B 75 10";
+    static uintptr_t FindViaStringRef(uintptr_t base, const char* needle) {
+        auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        auto nt  = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        size_t nlen = strlen(needle);
 
-    constexpr auto PAT_LUAD_CALL =
-        "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 49 8B F0 8B DA 48 8B F9";
+        // Step 1 — locate the string in any non-executable section
+        uintptr_t strAddr = 0;
+        {
+            auto sec = IMAGE_FIRST_SECTION(nt);
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections && !strAddr; ++i, ++sec) {
+                if (!(sec->Characteristics & IMAGE_SCN_MEM_READ))   continue;
+                if (  sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
+                auto start = base + sec->VirtualAddress;
+                auto end   = start + sec->Misc.VirtualSize;
+                for (auto p = start; p + nlen <= end; ++p)
+                    if (memcmp(reinterpret_cast<void*>(p), needle, nlen) == 0)
+                        { strAddr = p; break; }
+            }
+        }
+        if (!strAddr) return 0;
 
-    constexpr auto PAT_LUAD_PCALL =
-        "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 41 8B E9";
+        // Step 2 — scan executable sections for a RIP-relative LEA that targets strAddr
+        //   Encoding: [REX] 8D /r (mod=00, rm=101) disp32
+        //   REX byte is 0x48/0x49/0x4C/0x4D for 64-bit forms
+        {
+            auto sec = IMAGE_FIRST_SECTION(nt);
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+                if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+                auto start = base + sec->VirtualAddress;
+                auto end   = start + sec->Misc.VirtualSize;
 
-    constexpr auto PAT_LUAE_NEWTHREAD =
-        "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F9 33 F6 E8 ?? ?? ?? ??";
+                for (auto p = start; p + 7 <= end; ++p) {
+                    auto b = reinterpret_cast<const BYTE*>(p);
+                    // REX prefix (48-4F) + LEA opcode (8D) + ModRM mod=00 rm=101
+                    if (b[0] < 0x48 || b[0] > 0x4F) continue;
+                    if (b[1] != 0x8D)                continue;
+                    if ((b[2] & 0xC7) != 0x05)       continue;   // mod=00, rm=101
 
-    constexpr auto PAT_LUA_GETFIELD =
-        "48 89 5C 24 08 57 48 83 EC 20 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B CB";
+                    INT32 disp = *reinterpret_cast<const INT32*>(p + 3);
+                    if (reinterpret_cast<uintptr_t>(b + 7) + disp != strAddr) continue;
 
-    constexpr auto PAT_LUA_SETFIELD =
-        "48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B D9 41 8B F0 8B FA";
+                    // Found the LEA — walk backward to function start.
+                    // MSVC pads functions with 0xCC (INT3) bytes.
+                    auto scan = reinterpret_cast<const BYTE*>(p);
+                    uintptr_t limit = (p - start > 4096) ? p - 4096 : start;
+                    while (reinterpret_cast<uintptr_t>(scan) > limit) {
+                        --scan;
+                        if (*scan == 0xCC) {
+                            uintptr_t candidate = reinterpret_cast<uintptr_t>(scan + 1);
+                            // Sanity: must be >= 4 bytes before the LEA and < 4096 away
+                            if (candidate < p && p - candidate < 4096)
+                                return candidate;
+                        }
+                    }
+                    return p; // fallback: return address of the LEA itself
+                }
+            }
+        }
+        return 0;
+    }
+
+    // ── Follow a CALL rel32 at callSite+offset to its target ─────────────────
+    static uintptr_t FollowCall(uintptr_t callSite, int opcodeOff = 0) {
+        // call rel32 = E8 xx xx xx xx
+        if (*reinterpret_cast<BYTE*>(callSite + opcodeOff) != 0xE8) return 0;
+        INT32 rel = *reinterpret_cast<INT32*>(callSite + opcodeOff + 1);
+        return callSite + opcodeOff + 5 + rel;
+    }
+
+    // ── Find luaL_loadbuffer via "=(load)" string referenced from loadstring ──
+    // luaL_loadstring calls luaL_loadbuffer(L, s, strlen(s), "=(load)").
+    // We find the LEA that loads "=(load)" and then the CALL right after it.
+    static uintptr_t FindLoadBuffer(uintptr_t base) {
+        auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        auto nt  = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+
+        // Find "=(load)" string
+        const char* needle = "=(load)";
+        size_t nlen = strlen(needle);
+        uintptr_t strAddr = 0;
+        {
+            auto sec = IMAGE_FIRST_SECTION(nt);
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections && !strAddr; ++i, ++sec) {
+                if (!(sec->Characteristics & IMAGE_SCN_MEM_READ))   continue;
+                if (  sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
+                auto start = base + sec->VirtualAddress;
+                auto end   = start + sec->Misc.VirtualSize;
+                for (auto p = start; p + nlen <= end; ++p)
+                    if (memcmp(reinterpret_cast<void*>(p), needle, nlen) == 0)
+                        { strAddr = p; break; }
+            }
+        }
+        if (!strAddr) return 0;
+
+        // Find the LEA then look for CALL within 32 bytes after it
+        auto sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+            if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            auto start = base + sec->VirtualAddress;
+            auto end   = start + sec->Misc.VirtualSize;
+
+            for (auto p = start; p + 7 <= end; ++p) {
+                auto b = reinterpret_cast<const BYTE*>(p);
+                if (b[0] < 0x48 || b[0] > 0x4F) continue;
+                if (b[1] != 0x8D)                continue;
+                if ((b[2] & 0xC7) != 0x05)       continue;
+                INT32 disp = *reinterpret_cast<const INT32*>(p + 3);
+                if (reinterpret_cast<uintptr_t>(b + 7) + disp != strAddr) continue;
+
+                // Scan up to 32 bytes after LEA for a CALL rel32 (E8)
+                for (int off = 7; off < 40; ++off) {
+                    uintptr_t addr = p + off;
+                    if (addr + 5 > end) break;
+                    if (*reinterpret_cast<const BYTE*>(addr) == 0xE8) {
+                        uintptr_t target = FollowCall(addr);
+                        if (target > base && target < base + 0xC000000)
+                            return target;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
 
     inline bool Init() {
-        const char* mod = "RobloxPlayerBeta.exe";
+        static bool s_done = false;
+        if (s_done) return rLuaD_call != 0;
+        s_done = true;
 
-        rLuaL_loadbuffer = Scanner::ScanModule(mod, PAT_LOADBUFFER);
-        rLuaD_call       = Scanner::ScanModule(mod, PAT_LUAD_CALL);
-        rLuaD_pcall      = Scanner::ScanModule(mod, PAT_LUAD_PCALL);
-        rLuaE_newthread  = Scanner::ScanModule(mod, PAT_LUAE_NEWTHREAD);
-        rLua_getfield    = Scanner::ScanModule(mod, PAT_LUA_GETFIELD);
-        rLua_setfield    = Scanner::ScanModule(mod, PAT_LUA_SETFIELD);
+        uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("RobloxPlayerBeta.exe"));
 
-        // Log what we found / missed
-        char buf[256];
-        sprintf_s(buf, "[Offsets] loadbuffer=%llX dcall=%llX pcall=%llX newthread=%llX",
-            rLuaL_loadbuffer, rLuaD_call, rLuaD_pcall, rLuaE_newthread);
+        rLuaD_call       = FindViaStringRef(base, "C stack overflow");
+        rLuaD_pcall      = FindViaStringRef(base, "error in error handling");
+        rLuaL_loadbuffer = FindLoadBuffer(base);
+        rLuaE_newthread  = 0; // no reliable string ref; left for manual pattern update
+
+        // Write diagnostic log → %TEMP%\PrivateExec_addrs.txt
+        // Safe RVA helper: avoids underflow when addr == 0
+        auto rva = [base](uintptr_t addr) -> uintptr_t {
+            return addr ? addr - base : 0;
+        };
+
+        char tmp[MAX_PATH]{};
+        GetTempPathA(MAX_PATH, tmp);
+        char logPath[MAX_PATH]{};
+        sprintf_s(logPath, "%sPrivateExec_addrs.txt", tmp);
+
+        char buf[512]{};
+        sprintf_s(buf,
+            "base           = 0x%llX\n"
+            "luaD_call      = 0x%llX  (RVA 0x%llX)\n"
+            "luaD_pcall     = 0x%llX  (RVA 0x%llX)\n"
+            "luaL_loadbuffer= 0x%llX  (RVA 0x%llX)\n"
+            "luaE_newthread = 0x%llX  (RVA 0x%llX)\n",
+            base,
+            rLuaD_call,       rva(rLuaD_call),
+            rLuaD_pcall,      rva(rLuaD_pcall),
+            rLuaL_loadbuffer, rva(rLuaL_loadbuffer),
+            rLuaE_newthread,  rva(rLuaE_newthread));
+
+        HANDLE hf = CreateFileA(logPath, GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD w; WriteFile(hf, buf, (DWORD)strlen(buf), &w, nullptr);
+            CloseHandle(hf);
+        }
         OutputDebugStringA(buf);
 
-        // At minimum we need loadbuffer + dcall to execute scripts
-        return rLuaL_loadbuffer && rLuaD_call;
+        return rLuaD_call != 0; // minimum: need dcall; loadbuffer will also log 0 if missing
     }
 
 } // namespace LuaOffsets

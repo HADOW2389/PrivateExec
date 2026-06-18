@@ -8,10 +8,20 @@
 // MSVC C2712: __try cannot appear in a function that requires object unwinding.
 // Workaround: dedicated wrapper functions that only hold POD locals.
 
+// luaD_call(L, func, nResults)
+//   func = StkId (pointer into Lua stack) of the function to call.
+//   After luaL_loadbuffer the chunk sits at L->top - 1 TValue.
+//   lua_State::top pointer lives at offset +0x10 in Luau on x64;
+//   each TValue is 16 bytes.
 static int _seh_dcall(void* fn, void* L) {
     __try {
+        // Read L->top (offset 0x10 in lua_State on x64 Luau)
+        uintptr_t top_val = *reinterpret_cast<uintptr_t*>(
+            reinterpret_cast<uintptr_t>(L) + 0x10);
+        // StkId of the chunk = top - 1 TValue (16 bytes per TValue)
+        void* func_stkid = reinterpret_cast<void*>(top_val - 16);
         typedef void(*FnT)(void*, void*, int);
-        ((FnT)fn)(L, nullptr, 0);
+        ((FnT)fn)(L, func_stkid, 0);
         return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
