@@ -40,7 +40,6 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <!-- Strip strings and debug info -->
       <StringPooling>true</StringPooling>
       <PreprocessorDefinitions>NDEBUG;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
@@ -50,9 +49,6 @@
       <SubSystem>Console</SubSystem>
       <AdditionalDependencies>ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-    <Masm>
-      <UseSafeExceptionHandlers>false</UseSafeExceptionHandlers>
-    </Masm>
   </ItemDefinitionGroup>
 
   <ItemGroup>
@@ -64,15 +60,6 @@
     <ClInclude Include="Syscalls.hpp"/>
   </ItemGroup>
 
-  <ItemGroup>
-    <MASM Include="Syscalls.asm"/>
-  </ItemGroup>
-
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets"/>
-
-  <!-- Enable MASM -->
-  <ImportGroup Label="ExtensionTargets">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets"/>
-  </ImportGroup>
 
 </Project>
