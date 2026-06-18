@@ -1,6 +1,7 @@
 #pragma once
 #include "Scanner.hpp"
 #include <cstdint>
+#include <string>
 
 // Offsets for RobloxPlayerBeta.exe version-8884371d30284041
 // Static addresses are relative to module base (RobloxPlayerBeta.exe).
@@ -302,8 +303,8 @@ namespace Runtime {
         return std::string(reinterpret_cast<const char*>(strPtr), len);
     }
 
-    // Read class name
-    inline std::string GetClassName(uintptr_t inst) {
+    // Read class name (renamed to avoid conflict with Win32 GetClassName macro)
+    inline std::string GetInstanceClass(uintptr_t inst) {
         if (!inst) return "";
         auto desc      = *reinterpret_cast<uintptr_t*>(inst + offsets::ClassDescriptor);
         auto namePtr   = *reinterpret_cast<uintptr_t*>(desc + offsets::ClassDescriptorToClassName);

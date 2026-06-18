@@ -14,7 +14,7 @@ static void MainThread() {
 
     OutputDebugStringA("[Exec] DLL loaded, resolving offsets...");
 
-    if (!Offsets::Init()) {
+    if (!LuaOffsets::Init()) {
         OutputDebugStringA("[Exec] Offset resolution failed — version mismatch?");
         // Don't bail; pipe server still starts so the UI shows connected
     }

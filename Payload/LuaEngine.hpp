@@ -4,6 +4,29 @@
 #include <vector>
 #include <Windows.h>
 
+// ── SEH wrappers — must be plain functions with NO C++ objects in scope ───────
+// MSVC C2712: __try cannot appear in a function that requires object unwinding.
+// Workaround: dedicated wrapper functions that only hold POD locals.
+
+static int _seh_dcall(void* fn, void* L) {
+    __try {
+        typedef void(*FnT)(void*, void*, int);
+        ((FnT)fn)(L, nullptr, 0);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+static void* _seh_newthread(void* fn, void* L) {
+    __try {
+        typedef void*(*FnT)(void*);
+        return ((FnT)fn)(L);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
 // Lua execution engine.
 // Gets lua_State from ScriptContext, sets identity=8, pushes scripts via task scheduler.
 
@@ -65,9 +88,7 @@ namespace LuaEngine {
             return false;
         }
 
-        __try {
-            dcall(L, nullptr, 0);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (!_seh_dcall(reinterpret_cast<void*>(dcall), L)) {
             OutputDebugStringA("[LuaEngine] SEH caught during dcall");
             return false;
         }
@@ -128,8 +149,8 @@ namespace LuaEngine {
                 // Spawn a new coroutine per script for isolation
                 lua_State* co = g_L;
                 if (LuaOffsets::rLuaE_newthread) {
-                    auto newthread = reinterpret_cast<FnLuaENewThread>(LuaOffsets::rLuaE_newthread);
-                    __try { co = newthread(g_L); } __except (EXCEPTION_EXECUTE_HANDLER) { co = g_L; }
+                    void* result = _seh_newthread(LuaOffsets::rLuaE_newthread, g_L);
+                    if (result) co = result;
                 }
                 Execute(co ? co : g_L, entry.source);
             }
