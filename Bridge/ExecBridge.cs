@@ -86,27 +86,33 @@ namespace PrivateExec.Bridge {
         // ── Execute ───────────────────────────────────────────────────────────
         // Sends a Base64-encoded Lua script over our named pipe.
         // Pipe name: \\.\pipe\PrivateExec_{pid}
+        // Retries for up to 12 seconds — DLL pipe server may not be ready yet.
         public bool Execute(string script, int pid) {
             string pipeName = $"PrivateExec_{pid}";
             string b64      = Convert.ToBase64String(Encoding.UTF8.GetBytes(script));
             byte[] payload  = Encoding.UTF8.GetBytes(b64);
 
-            try {
-                using var pipe = new NamedPipeClientStream(
-                    ".", pipeName, PipeDirection.Out,
-                    PipeOptions.None);
-
-                pipe.Connect(3000); // 3-second timeout
-                pipe.Write(payload, 0, payload.Length);
-                pipe.Flush();
-                return true;
-            } catch (TimeoutException) {
-                Log("Pipe timeout — DLL not ready yet");
-                return false;
-            } catch (Exception ex) {
-                Log($"Execute exception: {ex.Message}");
-                return false;
+            var deadline = DateTime.UtcNow.AddSeconds(12);
+            while (DateTime.UtcNow < deadline) {
+                try {
+                    using var pipe = new NamedPipeClientStream(
+                        ".", pipeName, PipeDirection.Out, PipeOptions.None);
+                    pipe.Connect(1500);
+                    pipe.Write(payload, 0, payload.Length);
+                    pipe.Flush();
+                    return true;
+                } catch (TimeoutException) {
+                    // Pipe exists but busy — retry immediately
+                } catch (IOException) {
+                    // Pipe doesn't exist yet — DLL still initializing, wait and retry
+                    Thread.Sleep(400);
+                } catch (Exception ex) {
+                    Log($"Execute exception: {ex.Message}");
+                    return false;
+                }
             }
+            Log("Execute: pipe not available after 12s");
+            return false;
         }
 
         // ── Set workspace folder on the DLL side ─────────────────────────────

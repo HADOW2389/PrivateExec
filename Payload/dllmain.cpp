@@ -9,26 +9,23 @@
 // Everything runs asynchronously to avoid blocking the loader thread.
 
 static void MainThread() {
-    // Small delay to let Roblox finish loading its modules
+    // Start the pipe server FIRST so the UI can connect immediately.
+    // Scripts are queued and executed once LuaEngine is ready.
+    PipeServer::Start();
+    OutputDebugStringA("[Exec] Pipe server started.");
+
+    // Let Roblox finish loading its modules before touching Lua state
     Sleep(2500);
 
-    OutputDebugStringA("[Exec] DLL loaded, resolving offsets...");
-
-    if (!LuaOffsets::Init()) {
+    OutputDebugStringA("[Exec] Resolving offsets...");
+    if (!LuaOffsets::Init())
         OutputDebugStringA("[Exec] Offset resolution failed — version mismatch?");
-        // Don't bail; pipe server still starts so the UI shows connected
-    }
 
-    if (!LuaEngine::Init()) {
+    if (!LuaEngine::Init())
         OutputDebugStringA("[Exec] LuaEngine init failed");
-    }
-
-    // Start named pipe server — ready to receive scripts from the bridge
-    PipeServer::Start();
 
     OutputDebugStringA("[Exec] Ready.");
 
-    // Keep main thread alive — PipeServer runs on its own thread
     while (true) Sleep(5000);
 }
 
