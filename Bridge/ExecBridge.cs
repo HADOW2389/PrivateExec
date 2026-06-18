@@ -11,17 +11,26 @@ namespace PrivateExec.Bridge {
 
     public class ExecBridge {
 
+        // Directory of the actual EXE (not the single-file temp extraction folder).
+        // AppContext.BaseDirectory points to %TEMP%\.net\... for single-file apps.
+        private static string ExeDir =>
+            Path.GetDirectoryName(Environment.ProcessPath
+                ?? System.Diagnostics.Process.GetCurrentProcess().MainModule!.FileName)!;
+
         // Injector EXE must be placed next to the UI executable
         private static string InjectorPath =>
-            Path.Combine(AppContext.BaseDirectory, "Injector.exe");
+            Path.Combine(ExeDir, "Injector.exe");
 
         // DLL to map — must also be next to the UI executable
         private static string PayloadPath =>
-            Path.Combine(AppContext.BaseDirectory, "Payload.dll");
+            Path.Combine(ExeDir, "Payload.dll");
 
         // Workspace folder exposed to UNC functions inside the DLL
-        public string WorkspaceFolder { get; set; } =
-            Path.Combine(AppContext.BaseDirectory, "workspace");
+        public string WorkspaceFolder { get; set; }
+
+        public ExecBridge() {
+            WorkspaceFolder = Path.Combine(ExeDir, "workspace");
+        }
 
         // Path where Injector.exe writes its diagnostic log
         private static string LogPath =>
