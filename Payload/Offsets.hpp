@@ -200,89 +200,129 @@ namespace LuaOffsets {
     inline uintptr_t rLuaD_pcall      = 0;
     inline uintptr_t rLuaE_newthread  = 0;
 
+    // ── Page readability check ────────────────────────────────────────────────
+    // Hyperion may set code pages to PAGE_EXECUTE (no read bit).
+    // Reading such pages directly causes an AV. Use VirtualQuery to verify
+    // readability before scanning.
+    static bool IsReadable(uintptr_t addr) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)))
+            return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        DWORD p = mbi.Protect & ~(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
+        return p == PAGE_READONLY          || p == PAGE_READWRITE        ||
+               p == PAGE_EXECUTE_READ      || p == PAGE_EXECUTE_READWRITE||
+               p == PAGE_EXECUTE_WRITECOPY || p == PAGE_WRITECOPY;
+    }
+
+    // Returns the end of the VirtualQuery region that addr belongs to.
+    static uintptr_t RegionEnd(uintptr_t addr) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)))
+            return addr + 1;
+        return reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+
+    // ── Log file helper ───────────────────────────────────────────────────────
+    static void WriteLog(const char* buf) {
+        char tmp[MAX_PATH]{};
+        GetTempPathA(MAX_PATH, tmp);
+        char logPath[MAX_PATH]{};
+        sprintf_s(logPath, "%sPrivateExec_addrs.txt", tmp);
+        HANDLE hf = CreateFileA(logPath, GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD w; WriteFile(hf, buf, (DWORD)strlen(buf), &w, nullptr);
+            CloseHandle(hf);
+        }
+        OutputDebugStringA(buf);
+    }
+
     // ── String-reference based finder ────────────────────────────────────────
     // Locates a function by finding a LEA instruction that loads a known string
     // literal, then walks backward through INT3 padding to the function start.
-    // Works on the decrypted in-memory binary (disk scan fails because Hyperion
-    // encrypts the .text section on disk but decrypts it before execution).
+    // Works on the decrypted in-memory binary. Skips non-readable pages via
+    // VirtualQuery so PAGE_EXECUTE-only regions don't cause an AV.
 
     static uintptr_t FindViaStringRef(uintptr_t base, const char* needle) {
         auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
         auto nt  = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
         size_t nlen = strlen(needle);
 
-        // Step 1 — locate the string in any non-executable section
+        // Step 1 — locate the string in any non-executable (readable) section
         uintptr_t strAddr = 0;
         {
             auto sec = IMAGE_FIRST_SECTION(nt);
             for (WORD i = 0; i < nt->FileHeader.NumberOfSections && !strAddr; ++i, ++sec) {
                 if (!(sec->Characteristics & IMAGE_SCN_MEM_READ))   continue;
                 if (  sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
-                auto start = base + sec->VirtualAddress;
-                auto end   = start + sec->Misc.VirtualSize;
-                for (auto p = start; p + nlen <= end; ++p)
+                uintptr_t start = base + sec->VirtualAddress;
+                uintptr_t end   = start + sec->Misc.VirtualSize;
+                for (uintptr_t p = start; p + nlen <= end; ++p)
                     if (memcmp(reinterpret_cast<void*>(p), needle, nlen) == 0)
                         { strAddr = p; break; }
             }
         }
         if (!strAddr) return 0;
 
-        // Step 2 — scan executable sections for a RIP-relative LEA that targets strAddr
-        //   Encoding: [REX] 8D /r (mod=00, rm=101) disp32
-        //   REX byte is 0x48/0x49/0x4C/0x4D for 64-bit forms
+        // Step 2 — scan executable sections for a RIP-relative LEA targeting strAddr
+        //   Encoding: [REX 0x48-0x4F] [8D] [ModRM mod=00 rm=101] [disp32]
         {
             auto sec = IMAGE_FIRST_SECTION(nt);
             for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
                 if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-                auto start = base + sec->VirtualAddress;
-                auto end   = start + sec->Misc.VirtualSize;
+                uintptr_t start = base + sec->VirtualAddress;
+                uintptr_t end   = start + sec->Misc.VirtualSize;
 
-                for (auto p = start; p + 7 <= end; ++p) {
-                    auto b = reinterpret_cast<const BYTE*>(p);
-                    // REX prefix (48-4F) + LEA opcode (8D) + ModRM mod=00 rm=101
-                    if (b[0] < 0x48 || b[0] > 0x4F) continue;
-                    if (b[1] != 0x8D)                continue;
-                    if ((b[2] & 0xC7) != 0x05)       continue;   // mod=00, rm=101
-
-                    INT32 disp = *reinterpret_cast<const INT32*>(p + 3);
-                    if (reinterpret_cast<uintptr_t>(b + 7) + disp != strAddr) continue;
-
-                    // Found the LEA — walk backward to function start.
-                    // MSVC pads functions with 0xCC (INT3) bytes.
-                    auto scan = reinterpret_cast<const BYTE*>(p);
-                    uintptr_t limit = (p - start > 4096) ? p - 4096 : start;
-                    while (reinterpret_cast<uintptr_t>(scan) > limit) {
-                        --scan;
-                        if (*scan == 0xCC) {
-                            uintptr_t candidate = reinterpret_cast<uintptr_t>(scan + 1);
-                            // Sanity: must be >= 4 bytes before the LEA and < 4096 away
-                            if (candidate < p && p - candidate < 4096)
-                                return candidate;
-                        }
+                uintptr_t p = start;
+                while (p + 7 <= end) {
+                    // Skip non-readable pages using VirtualQuery
+                    if (!IsReadable(p)) {
+                        p = RegionEnd(p);
+                        continue;
                     }
-                    return p; // fallback: return address of the LEA itself
+                    // Scan up to the end of this readable region
+                    uintptr_t rend = min(RegionEnd(p), end);
+                    for (; p + 7 <= rend; ++p) {
+                        auto b = reinterpret_cast<const BYTE*>(p);
+                        if (b[0] < 0x48 || b[0] > 0x4F) continue;
+                        if (b[1] != 0x8D)                continue;
+                        if ((b[2] & 0xC7) != 0x05)       continue;
+
+                        INT32 disp = *reinterpret_cast<const INT32*>(p + 3);
+                        if (reinterpret_cast<uintptr_t>(b + 7) + disp != strAddr) continue;
+
+                        // Found LEA — walk backward through INT3 padding to function start
+                        const BYTE* scan = reinterpret_cast<const BYTE*>(p);
+                        uintptr_t limit = (p - start > 4096) ? p - 4096 : start;
+                        while (reinterpret_cast<uintptr_t>(scan) > limit) {
+                            --scan;
+                            if (*scan == 0xCC) {
+                                uintptr_t candidate = reinterpret_cast<uintptr_t>(scan + 1);
+                                if (candidate < p && p - candidate < 4096)
+                                    return candidate;
+                            }
+                        }
+                        return p; // fallback: LEA address itself
+                    }
                 }
             }
         }
         return 0;
     }
 
-    // ── Follow a CALL rel32 at callSite+offset to its target ─────────────────
+    // ── Follow a CALL rel32 ───────────────────────────────────────────────────
     static uintptr_t FollowCall(uintptr_t callSite, int opcodeOff = 0) {
-        // call rel32 = E8 xx xx xx xx
         if (*reinterpret_cast<BYTE*>(callSite + opcodeOff) != 0xE8) return 0;
         INT32 rel = *reinterpret_cast<INT32*>(callSite + opcodeOff + 1);
         return callSite + opcodeOff + 5 + rel;
     }
 
-    // ── Find luaL_loadbuffer via "=(load)" string referenced from loadstring ──
-    // luaL_loadstring calls luaL_loadbuffer(L, s, strlen(s), "=(load)").
-    // We find the LEA that loads "=(load)" and then the CALL right after it.
+    // ── Find luaL_loadbuffer via "=(load)" string ─────────────────────────────
     static uintptr_t FindLoadBuffer(uintptr_t base) {
         auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
         auto nt  = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
 
-        // Find "=(load)" string
         const char* needle = "=(load)";
         size_t nlen = strlen(needle);
         uintptr_t strAddr = 0;
@@ -291,38 +331,41 @@ namespace LuaOffsets {
             for (WORD i = 0; i < nt->FileHeader.NumberOfSections && !strAddr; ++i, ++sec) {
                 if (!(sec->Characteristics & IMAGE_SCN_MEM_READ))   continue;
                 if (  sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
-                auto start = base + sec->VirtualAddress;
-                auto end   = start + sec->Misc.VirtualSize;
-                for (auto p = start; p + nlen <= end; ++p)
+                uintptr_t start = base + sec->VirtualAddress;
+                uintptr_t end   = start + sec->Misc.VirtualSize;
+                for (uintptr_t p = start; p + nlen <= end; ++p)
                     if (memcmp(reinterpret_cast<void*>(p), needle, nlen) == 0)
                         { strAddr = p; break; }
             }
         }
         if (!strAddr) return 0;
 
-        // Find the LEA then look for CALL within 32 bytes after it
         auto sec = IMAGE_FIRST_SECTION(nt);
         for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
             if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-            auto start = base + sec->VirtualAddress;
-            auto end   = start + sec->Misc.VirtualSize;
+            uintptr_t start = base + sec->VirtualAddress;
+            uintptr_t end   = start + sec->Misc.VirtualSize;
 
-            for (auto p = start; p + 7 <= end; ++p) {
-                auto b = reinterpret_cast<const BYTE*>(p);
-                if (b[0] < 0x48 || b[0] > 0x4F) continue;
-                if (b[1] != 0x8D)                continue;
-                if ((b[2] & 0xC7) != 0x05)       continue;
-                INT32 disp = *reinterpret_cast<const INT32*>(p + 3);
-                if (reinterpret_cast<uintptr_t>(b + 7) + disp != strAddr) continue;
+            uintptr_t p = start;
+            while (p + 7 <= end) {
+                if (!IsReadable(p)) { p = RegionEnd(p); continue; }
+                uintptr_t rend = min(RegionEnd(p), end);
+                for (; p + 7 <= rend; ++p) {
+                    auto b = reinterpret_cast<const BYTE*>(p);
+                    if (b[0] < 0x48 || b[0] > 0x4F) continue;
+                    if (b[1] != 0x8D)                continue;
+                    if ((b[2] & 0xC7) != 0x05)       continue;
+                    INT32 disp = *reinterpret_cast<const INT32*>(p + 3);
+                    if (reinterpret_cast<uintptr_t>(b + 7) + disp != strAddr) continue;
 
-                // Scan up to 32 bytes after LEA for a CALL rel32 (E8)
-                for (int off = 7; off < 40; ++off) {
-                    uintptr_t addr = p + off;
-                    if (addr + 5 > end) break;
-                    if (*reinterpret_cast<const BYTE*>(addr) == 0xE8) {
-                        uintptr_t target = FollowCall(addr);
-                        if (target > base && target < base + 0xC000000)
-                            return target;
+                    for (int off = 7; off < 40; ++off) {
+                        uintptr_t addr = p + off;
+                        if (addr + 5 > end) break;
+                        if (*reinterpret_cast<const BYTE*>(addr) == 0xE8) {
+                            uintptr_t target = FollowCall(addr);
+                            if (target > base && target < base + 0xC000000)
+                                return target;
+                        }
                     }
                 }
             }
@@ -337,21 +380,19 @@ namespace LuaOffsets {
 
         uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("RobloxPlayerBeta.exe"));
 
+        // Write preliminary log immediately — survives even if scan crashes
+        {
+            char buf[256]{};
+            sprintf_s(buf, "base = 0x%llX\n[scanning...]\n", base);
+            WriteLog(buf);
+        }
+
         rLuaD_call       = FindViaStringRef(base, "C stack overflow");
         rLuaD_pcall      = FindViaStringRef(base, "error in error handling");
         rLuaL_loadbuffer = FindLoadBuffer(base);
-        rLuaE_newthread  = 0; // no reliable string ref; left for manual pattern update
+        rLuaE_newthread  = 0;
 
-        // Write diagnostic log → %TEMP%\PrivateExec_addrs.txt
-        // Safe RVA helper: avoids underflow when addr == 0
-        auto rva = [base](uintptr_t addr) -> uintptr_t {
-            return addr ? addr - base : 0;
-        };
-
-        char tmp[MAX_PATH]{};
-        GetTempPathA(MAX_PATH, tmp);
-        char logPath[MAX_PATH]{};
-        sprintf_s(logPath, "%sPrivateExec_addrs.txt", tmp);
+        auto rva = [base](uintptr_t a) -> uintptr_t { return a ? a - base : 0; };
 
         char buf[512]{};
         sprintf_s(buf,
@@ -365,16 +406,9 @@ namespace LuaOffsets {
             rLuaD_pcall,      rva(rLuaD_pcall),
             rLuaL_loadbuffer, rva(rLuaL_loadbuffer),
             rLuaE_newthread,  rva(rLuaE_newthread));
+        WriteLog(buf);
 
-        HANDLE hf = CreateFileA(logPath, GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf != INVALID_HANDLE_VALUE) {
-            DWORD w; WriteFile(hf, buf, (DWORD)strlen(buf), &w, nullptr);
-            CloseHandle(hf);
-        }
-        OutputDebugStringA(buf);
-
-        return rLuaD_call != 0; // minimum: need dcall; loadbuffer will also log 0 if missing
+        return rLuaD_call != 0;
     }
 
 } // namespace LuaOffsets
