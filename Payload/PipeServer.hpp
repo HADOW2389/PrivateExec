@@ -2,26 +2,26 @@
 #include "LuaEngine.hpp"
 #include <Windows.h>
 #include <string>
-#include <thread>
 #include <atomic>
 
-// Named pipe server — receives Base64-encoded Lua scripts from the C# bridge.
-// Pipe name: \\.\pipe\PrivateExec_{pid}
+// Script watcher — polls a temp file instead of named pipes.
+// Hyperion can block CreateNamedPipe; plain file I/O is never filtered.
+// Protocol: UI writes Base64(script) to %TEMP%\PrivateExec_<pid>.b64
+//           DLL reads, deletes, decodes, pushes to LuaEngine queue.
 
 namespace PipeServer {
 
-    inline std::string g_pipeName;
     inline std::atomic<bool> g_running{ false };
-    inline std::thread g_thread;
+    inline std::string       g_cmdFile;
 
-    // Base64 decoder
     static std::string B64Decode(const std::string& enc) {
-        static const std::string table =
+        static const char tbl[] =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        std::string out;
-        std::vector<int> T(256, -1);
-        for (int i = 0; i < 64; ++i) T[table[i]] = i;
+        int T[256];
+        for (auto& v : T) v = -1;
+        for (int i = 0; i < 64; ++i) T[(unsigned char)tbl[i]] = i;
 
+        std::string out;
         int val = 0, bits = -8;
         for (unsigned char c : enc) {
             if (T[c] == -1) continue;
@@ -35,68 +35,61 @@ namespace PipeServer {
         return out;
     }
 
-    static void ServeOnePipe() {
-        HANDLE hPipe = CreateNamedPipeA(
-            g_pipeName.c_str(),
-            PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,          // max instances
-            0,          // out buffer
-            1 << 20,    // in buffer 1 MB
-            0,
-            nullptr);
-
-        if (hPipe == INVALID_HANDLE_VALUE) return;
-
-        if (!ConnectNamedPipe(hPipe, nullptr) &&
-            GetLastError() != ERROR_PIPE_CONNECTED) {
-            CloseHandle(hPipe);
-            return;
-        }
-
-        std::string data;
-        char buf[4096];
-        DWORD read = 0;
-        while (ReadFile(hPipe, buf, sizeof(buf), &read, nullptr) && read)
-            data.append(buf, read);
-
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
-
-        if (data.empty()) return;
-
-        std::string script = B64Decode(data);
-
-        // Special commands (same protocol as Velocity for UI compatibility)
-        if (script.rfind("setworkspacefolder: ", 0) == 0) {
-            LuaEngine::g_workspaceFolder = script.substr(20);
-            return;
-        }
-
-        LuaEngine::PushScript(std::move(script));
-    }
-
-    static void ServerLoop() {
+    static DWORD WINAPI WatchThread(LPVOID) {
         while (g_running) {
-            ServeOnePipe(); // blocks until a client connects and disconnects
+            Sleep(300);
+
+            // Try to open and read the command file
+            HANDLE hFile = CreateFileA(
+                g_cmdFile.c_str(),
+                GENERIC_READ,
+                0,          // exclusive — prevents partial reads
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+
+            if (hFile == INVALID_HANDLE_VALUE) continue;
+
+            DWORD sz = GetFileSize(hFile, nullptr);
+            std::string data;
+            if (sz && sz != INVALID_FILE_SIZE) {
+                data.resize(sz);
+                DWORD rd = 0;
+                ReadFile(hFile, data.data(), sz, &rd, nullptr);
+                data.resize(rd);
+            }
+            CloseHandle(hFile);
+
+            // Delete command file so we don't re-execute
+            DeleteFileA(g_cmdFile.c_str());
+
+            if (data.empty()) continue;
+
+            std::string script = B64Decode(data);
+            if (script.rfind("setworkspacefolder: ", 0) == 0) {
+                LuaEngine::g_workspaceFolder = script.substr(20);
+                continue;
+            }
+
+            LuaEngine::PushScript(std::move(script));
         }
+        return 0;
     }
 
     inline void Start() {
         DWORD pid = GetCurrentProcessId();
-        g_pipeName = "\\\\.\\pipe\\PrivateExec_" + std::to_string(pid);
-        g_running  = true;
-        g_thread   = std::thread(ServerLoop);
-        g_thread.detach();
-        OutputDebugStringA(("[PipeServer] Listening on " + g_pipeName).c_str());
+        char tmp[MAX_PATH]{};
+        GetTempPathA(MAX_PATH, tmp);
+        g_cmdFile = std::string(tmp) + "PrivateExec_" + std::to_string(pid) + ".b64";
+        g_running = true;
+
+        HANDLE h = CreateThread(nullptr, 0, WatchThread, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+
+        OutputDebugStringA(("[ScriptWatcher] Watching: " + g_cmdFile).c_str());
     }
 
-    inline void Stop() {
-        g_running = false;
-        // Unblock the blocking ConnectNamedPipe by connecting ourselves
-        HANDLE h = CreateFileA(g_pipeName.c_str(), GENERIC_WRITE, 0,
-                               nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    }
+    inline void Stop() { g_running = false; }
 
 } // namespace PipeServer

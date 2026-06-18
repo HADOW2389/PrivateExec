@@ -1,7 +1,6 @@
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 
@@ -85,34 +84,25 @@ namespace PrivateExec.Bridge {
         }
 
         // ── Execute ───────────────────────────────────────────────────────────
-        // Sends a Base64-encoded Lua script over our named pipe.
-        // Pipe name: \\.\pipe\PrivateExec_{pid}
-        // Retries for up to 12 seconds — DLL pipe server may not be ready yet.
+        // Drops a Base64-encoded script into %TEMP%\PrivateExec_{pid}.b64.
+        // The DLL polls that file every 300ms, reads it, deletes it, executes.
+        // No named pipe needed — works even if Hyperion blocks CreateNamedPipe.
         public bool Execute(string script, int pid) {
-            string pipeName = $"PrivateExec_{pid}";
-            string b64      = Convert.ToBase64String(Encoding.UTF8.GetBytes(script));
-            byte[] payload  = Encoding.UTF8.GetBytes(b64);
+            string cmdFile = Path.Combine(
+                Path.GetTempPath(), $"PrivateExec_{pid}.b64");
+            string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(script));
 
-            var deadline = DateTime.UtcNow.AddSeconds(12);
-            while (DateTime.UtcNow < deadline) {
+            for (int i = 0; i < 8; i++) {
                 try {
-                    using var pipe = new NamedPipeClientStream(
-                        ".", pipeName, PipeDirection.Out, PipeOptions.None);
-                    pipe.Connect(1500);
-                    pipe.Write(payload, 0, payload.Length);
-                    pipe.Flush();
+                    File.WriteAllText(cmdFile, b64);
+                    Log($"Execute: wrote {cmdFile}");
                     return true;
-                } catch (TimeoutException) {
-                    // Pipe exists but busy — retry immediately
-                } catch (IOException) {
-                    // Pipe doesn't exist yet — DLL still initializing, wait and retry
-                    Thread.Sleep(400);
                 } catch (Exception ex) {
-                    Log($"Execute exception: {ex.Message}");
-                    return false;
+                    Log($"Execute write attempt {i}: {ex.Message}");
+                    Thread.Sleep(200);
                 }
             }
-            Log("Execute: pipe not available after 12s");
+            Log("Execute: failed to write command file");
             return false;
         }
 
