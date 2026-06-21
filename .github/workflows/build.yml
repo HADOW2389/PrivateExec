@@ -53,6 +53,12 @@ jobs:
             /p:SolutionDir="${{ github.workspace }}\" `
             /m
 
+      # ── 6.5. Сборка Bypass.dll (C++ DLL) ────────────────────────────────────
+      - name: Build Bypass DLL
+        working-directory: src
+        run: |
+          cl.exe /LD /MD /O2 /EHsc Bypass.cpp /link /MACHINE:X64
+
       # ── 7. Сборка UI (C# WPF) ───────────────────────────────────────────────
       - name: Build UI
         working-directory: UI
@@ -72,6 +78,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "$bin\Injector.exe" "$out\Injector.exe" -Force
           Copy-Item "$bin\Payload.dll"  "$out\Payload.dll"  -Force
+          Copy-Item "${{ github.workspace }}\src\Bypass.dll" "$out\Bypass.dll" -Force
           New-Item -ItemType Directory -Force -Path "$out\workspace" | Out-Null
           Write-Host "Contents of publish:"
           Get-ChildItem $out
